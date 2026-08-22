@@ -220,6 +220,7 @@
 (require 'text-property-search)
 (require 'cl-generic)
 (eval-and-compile (require 'gptel-request))
+(require 'gptel-backoff)
 
 
 ;;; User options
