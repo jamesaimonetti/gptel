@@ -2,6 +2,23 @@
 
 * 0.9.9.6-pre
 
+** New features
+
+- ~gptel-request~ now accepts a ~retry~ keyword argument (default t).
+  When a request fails with a retryable provider error (HTTP 429/5xx,
+  a Retry-After header, an x-should-retry: true header, or a known
+  retryable error type in the JSON error body such as
+  =rate_limit_error= or =overloaded_error=), gptel waits with
+  exponential backoff plus jitter and transparently re-issues the
+  request.  The retry budget, base/max delay and jitter are
+  configurable with the new ~gptel-backoff-*~ user options, and can be
+  overridden per backend via ~gptel-backoff--backend-settings~.
+
+- gptel can now limit concurrent requests per backend with
+  ~gptel-backoff-default-concurrency~ (or the =:concurrency= entry in
+  ~gptel-backoff--backend-settings~).  Excess requests queue and are
+  released as slots free.
+
 ** Breaking changes
 
 - The Github Models setup instructions have been removed from the
