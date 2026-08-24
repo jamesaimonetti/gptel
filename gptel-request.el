@@ -2435,13 +2435,8 @@ BUF defaults to the current buffer."
         (and-let* ((cb (plist-get info :callback))
                    ((functionp cb)))
           (funcall cb 'abort info)))
-      (funcall abort-fn)               ;parked requests: removes nil-keyed entry
-      (gptel-backoff--release fsm)
-      ;; Only remove the keyed entry for live (non-parked) requests.  A
-      ;; parked request has PROC == nil and shares that key with every
-      ;; other parked request; alist-get would delete the FIRST nil-keyed
-      ;; cell, orphaning an unrelated parked request.  Its entry was
-      ;; already removed by ABORT-FN (gptel-backoff--cleanup-parked).
+      ;; guard: only remove keyed entry for live (non-parked) requests;
+      ;; parked requests have PROC==nil and share the nil key.
       (when proc
         (setf (alist-get proc gptel--request-alist nil 'remove) nil))
       (gptel--fsm-transition fsm 'ABRT)
