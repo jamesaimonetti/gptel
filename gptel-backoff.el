@@ -168,12 +168,17 @@ An alist of (BACKEND-NAME . PLIST).  Recognized PLIST keys:
 (defun gptel-backoff--setting (backend key &optional default)
   "Return BACKEND's setting KEY, or DEFAULT.
 
-Per-backend settings from `gptel-backoff--backend-settings' take
-precedence over the global defaults."
+KEY can be given either as a keyword (`:max-retries') or as the
+corresponding plain symbol (`max-retries'): both are normalized
+to a keyword before lookup, since
+`gptel-backoff--backend-settings' is a plist keyed by keywords.
+Per-backend settings take precedence over the global defaults."
   (or (plist-get (alist-get (gptel-backend-name backend)
                             gptel-backoff--backend-settings
                             nil nil #'equal)
-                 key)
+                 (if (keywordp key)
+                     key
+                   (intern (concat ":" (symbol-name key)))))
       default))
 
 (defun gptel-backoff--status-int (status)
@@ -246,10 +251,17 @@ the header is absent or unparseable."
 (defun gptel-backoff--jitter (delay factor)
   "Return DELAY adjusted by +/-FACTOR random jitter.
 
-FACTOR 0 (or nil) returns DELAY unchanged."
+FACTOR 0 (or nil) returns DELAY unchanged.
+
+The random component is uniformly distributed in [-1, 1).  The
+limit passed to `random' must be a positive integer (Emacs Lisp
+Reference, \"Random Numbers\"): passing a float yields an
+arbitrary fixnum, which would produce astronomically large (or
+zero) delays."
   (if (or (null factor) (zerop factor))
       delay
-    (max 0.0 (* delay (1+ (* factor (- (* 2 (random 1000.0)) 1000.0) 0.001))))))
+    (max 0.0
+         (* delay (1+ (* factor (- (/ (float (random 2000)) 1000.0) 1.0)))))))
 
 (defun gptel-backoff--delay (attempt info)
   "Compute the backoff delay before retry ATTEMPT of request INFO.
@@ -271,11 +283,18 @@ configured maximum, then applies jitter."
 
 Consults `gptel-backoff-enabled', the attempt budget and the
 provider's retry signals.  This predicate is side-effect-free; the
-attempt counter is incremented in `gptel-backoff--handle-retry'."
+attempt counter is incremented in `gptel-backoff--handle-retry'.
+
+A nil :backend is treated as not retryable (the retry timer and
+generics need a real backend, and transport-level failures without
+an HTTP response are never retried anyway)."
   (and gptel-backoff-enabled
        (let* ((backend (plist-get info :backend))
               (attempts (or (plist-get info :backoff-attempts) 0))
-              (max (gptel-backoff--setting backend 'max-retries gptel-backoff-max-retries)))
+              (max (if backend
+                       (gptel-backoff--setting backend 'max-retries
+                                               gptel-backoff-max-retries)
+                     gptel-backoff-max-retries)))
          (and (< attempts max)
               (gptel-backoff--retryable-p backend info)))))
 
@@ -408,6 +427,7 @@ available (and no cooldown is active), dispatch via
                   (gptel-backoff--release-backend backend sem)))
             ;; Over limit or cooling down: park in QUEUE.
             (plist-put info :queued t)
+            (push fsm (nth 1 sem))  ;must join the semaphore queue for pump to resume it
             (gptel-backoff--register-parked fsm)
             (gptel-backoff--schedule-cooldown-pump backend sem)
             (gptel--fsm-transition fsm 'QUEUE)))
