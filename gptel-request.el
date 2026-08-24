@@ -66,6 +66,8 @@
 (declare-function gptel-backoff--install "gptel-backoff")
 (declare-function gptel-backoff--release "gptel-backoff")
 (declare-function gptel-backoff--parked-p "gptel-backoff")
+(declare-function gptel-backoff--installed-p "gptel-backoff")
+(declare-function gptel-backoff--retry-p "gptel-backoff")
 
 
 ;;; User options
@@ -2395,25 +2397,26 @@ BUF defaults to the current buffer."
                (cl-find-if
                 (lambda (entry)
                   ;; each entry has the form (PROC . (FSM ABORT-FN))
+                  ;; PROC is nil for requests parked in RTRY/QUEUE.
                   (eq (thread-first (cadr entry) ; FSM
                                     (gptel-fsm-info)
                                     (plist-get :buffer))
                       buf))
                 gptel--request-alist))
-              (proc (car proc-attrs))
               (fsm (cadr proc-attrs))
               (info (gptel-fsm-info fsm))
               (abort-fn (cddr proc-attrs)))
-    ;; Run :callback with abort signal
-    (with-demoted-errors "Callback error: %S"
-      (and-let* ((cb (plist-get info :callback))
-                 ((functionp cb)))
-        (funcall cb 'abort info)))
-    (funcall abort-fn)
-    (gptel-backoff--release fsm)
-    (setf (alist-get proc gptel--request-alist nil 'remove) nil)
-    (gptel--fsm-transition fsm 'ABRT)
-    (message "Stopped gptel request in buffer %S" (buffer-name buf))))
+    (let ((proc (car proc-attrs)))
+      ;; Run :callback with abort signal
+      (with-demoted-errors "Callback error: %S"
+        (and-let* ((cb (plist-get info :callback))
+                   ((functionp cb)))
+          (funcall cb 'abort info)))
+      (funcall abort-fn)
+      (gptel-backoff--release fsm)
+      (setf (alist-get proc gptel--request-alist nil 'remove) nil)
+      (gptel--fsm-transition fsm 'ABRT)
+      (message "Stopped gptel request in buffer %S" (buffer-name buf)))))
 
 
 ;;; Prompt creation
@@ -2718,11 +2721,15 @@ the response is inserted into the current buffer after point."
                              (when headers (plist-put info :http-headers headers))
                              (gptel--fsm-transition fsm) ;WAIT -> TYPE
                              (when error (plist-put info :error error))
-                             (if (gptel-backoff--parked-p fsm)
-                                 ;; Retryable error -> RTRY, or limiter -> QUEUE.
-                                 ;; Release the limiter slot; do not surface a
-                                 ;; transient error or re-transition.
+                             (if (and (gptel-backoff--installed-p fsm)
+                                      (gptel-backoff--retry-p info))
+                                 ;; Retryable error within the attempt budget:
+                                 ;; park in RTRY without invoking the callback.
+                                 ;; Custom fsms (e.g. gptel-rewrite) treat a
+                                 ;; nil callback as terminal, so it must not
+                                 ;; fire for a transient failure.
                                  (progn
+                                   (gptel--fsm-transition fsm) ;TYPE -> RTRY
                                    (gptel-backoff--release fsm)
                                    (setf (alist-get buf gptel--request-alist nil 'remove) nil)
                                    (kill-buffer buf))
@@ -3030,48 +3037,60 @@ PROCESS and _STATUS are process parameters."
         (exit-status (process-exit-status process)))
     (let* ((fsm (car (alist-get process gptel--request-alist)))
            (info (gptel-fsm-info fsm))
-           (http-status (plist-get info :http-status)))
+           (http-status (plist-get info :http-status))
+           (callback (plist-get info :callback)))
       (when gptel-log-level (gptel-curl--log-response proc-buf info)) ;logging
       (cond
-       ;; Curl exited with a non-zero status: connection-level failure
+       ;; Curl exited with a non-zero status: connection-level failure.
        ((not (zerop exit-status))
-        ;; MAYBE: This transition should happen in the process filter, but it's
-        ;; not clear how to reliably detect Curl failure there.
-        (gptel--fsm-transition fsm)     ;Curl failed, WAIT -> TYPE
         (plist-put info :error
                    (format "Curl failed with exit code %d. See Curl manpage for details."
                            exit-status))
-        (plist-put info :status "Curl failure")
+        (plist-put info :status "Curl failure"))
+       ;; Finish handling a successful streaming response.  A retryable
+       ;; in-band error (e.g. Anthropic `overloaded_error` mid-stream) has
+       ;; already set :error; do not announce success in that case.
+       ((and (member http-status '("200" "100"))
+             (not (and (gptel-backoff--installed-p fsm)
+                       (gptel-backoff--retry-p info))))
         (with-demoted-errors "gptel callback error: %S"
-          (funcall (plist-get info :callback) nil info)))
-       ;; Finish handling a successful streaming response
-       ((member http-status '("200" "100"))
-        (with-demoted-errors "gptel callback error: %S"
-          (funcall (plist-get info :callback) t info)))
+          (funcall callback t info)))
        ;; Capture error message from HTTP error response
        (t
-        (with-current-buffer proc-buf
-          (goto-char (point-max))
-          (if (not (search-backward (plist-get info :uuid) nil t))
-              (plist-put info :error "Could not parse Curl response")
-            (backward-char)
-            (pcase-let* ((`(,_ . ,header-size) (read (current-buffer)))
-                         (header-alist (gptel--parse-http-headers (point-min) header-size))
-                         (response (progn (goto-char header-size)
-                                          (condition-case nil (gptel--json-read)
-                                            (error 'json-read-error))))
-                         (error-data (gptel--parse-response-error response)))
-              (when header-alist (plist-put info :http-headers header-alist))
-              (cond
-               (error-data
-                (plist-put info :error error-data))
-               ((eq response 'json-read-error)
-                (plist-put info :error "Malformed JSON in response."))
-               (t (plist-put info :error "Could not parse HTTP response."))))))
-        (with-demoted-errors "gptel callback error: %S"
-          (funcall (plist-get info :callback) nil info))))
-      (gptel--fsm-transition fsm)      ; Move to next state
-      (gptel-backoff--release fsm))
+        (unless (member http-status '("200" "100"))
+          (with-current-buffer proc-buf
+            (goto-char (point-max))
+            (if (not (search-backward (plist-get info :uuid) nil t))
+                (plist-put info :error "Could not parse Curl response")
+              (backward-char)
+              (pcase-let* ((`(,_ . ,header-size) (read (current-buffer)))
+                           (header-alist (gptel--parse-http-headers (point-min) header-size))
+                           (response (progn (goto-char header-size)
+                                            (condition-case nil (gptel--json-read)
+                                              (error 'json-read-error))))
+                           (error-data (gptel--parse-response-error response)))
+                (when header-alist (plist-put info :http-headers header-alist))
+                (cond
+                 (error-data
+                  (plist-put info :error error-data))
+                 ((eq response 'json-read-error)
+                  (plist-put info :error "Malformed JSON in response."))
+                 (t (plist-put info :error "Could not parse HTTP response.")))))))))
+      ;; Advance the dispatch point exactly once.  The filter has already
+      ;; done WAIT -> TYPE when it parsed the status line; if it never did
+      ;; (empty response or connection failure before a status line), do it
+      ;; here.
+      (when (eq (gptel-fsm-state fsm) 'WAIT)
+        (gptel--fsm-transition fsm))    ;WAIT -> TYPE
+      (gptel--fsm-transition fsm)       ;TYPE -> RTRY/ERRS/TOOL/DONE
+      ;; A retryable error was parked in RTRY by the transition above: do
+      ;; not surface a spurious failure.  Otherwise, if the response was
+      ;; not a success, deliver the terminal nil callback.
+      (unless (gptel-backoff--parked-p fsm)
+        (unless (member http-status '("200" "100"))
+          (with-demoted-errors "gptel callback error: %S"
+            (funcall callback nil info))))
+      (gptel-backoff--release fsm))     ;release slot/queue position
     (setf (alist-get process gptel--request-alist nil 'remove) nil)
     (kill-buffer proc-buf)))
 
@@ -3199,11 +3218,19 @@ PROCESS and _STATUS are process parameters."
               (when headers (plist-put proc-info :http-headers headers))
               (gptel--fsm-transition fsm) ;WAIT -> TYPE
               (when error (plist-put proc-info :error error))
-              (if (gptel-backoff--parked-p fsm)
-                  ;; Retryable error -> RTRY, or limiter -> QUEUE.
-                  ;; The backoff machinery owns the request; do not surface
-                  ;; a transient error or re-transition.
-                  (gptel-backoff--release fsm)
+              (if (and (gptel-backoff--installed-p fsm)
+                       (gptel-backoff--retry-p proc-info))
+                  ;; Retryable error within the attempt budget: park in
+                  ;; RTRY without invoking the callback.  The backoff
+                  ;; machinery owns the request from here; the timer will
+                  ;; re-enter WAIT to re-issue it.
+                  (progn
+                    (gptel--fsm-transition fsm) ;TYPE -> RTRY
+                    (gptel-backoff--release fsm))
+                ;; Success or terminal failure: run the callback, then
+                ;; advance.  The callback must run before TYPE -> next so
+                ;; that DONE/TOOL handlers see the response already in the
+                ;; buffer (buffer-layout ordering is load-bearing).
                 (progn
                   ;; Look for a reasoning block
                   (if (and (stringp response) (string-match-p "^\\s-* thinking" response))
@@ -3223,21 +3250,21 @@ PROCESS and _STATUS are process parameters."
                       (funcall proc-callback response proc-info)))
                   (gptel--fsm-transition fsm) ;TYPE -> next
                   (gptel-backoff--release fsm))))
-          ;; Curl exited with a non-zero status: connection-level failure
+          ;; Curl exited with a non-zero status: connection-level failure.
+          ;; Not retryable (no HTTP status was received); route to ERRS.
           (plist-put proc-info :error
                      (format "Curl failed with exit code %d. See Curl manpage for details."
                              exit-status))
           (plist-put proc-info :status "Curl failure")
           (gptel--fsm-transition fsm)   ;WAIT -> TYPE
-          (if (gptel-backoff--parked-p fsm)
-              (gptel-backoff--release fsm)
-            (progn
-              (with-demoted-errors "gptel callback error: %S"
-                (funcall proc-callback nil proc-info))
-              (gptel--fsm-transition fsm) ;TYPE -> next
-              (gptel-backoff--release fsm)))))
-      (gptel--fsm-transition fsm)       ;TYPE -> next
-      (gptel-backoff--release fsm)
+          (gptel--fsm-transition fsm)   ;TYPE -> next (ERRS)
+          (with-demoted-errors "gptel callback error: %S"
+            (funcall proc-callback nil proc-info))
+          (gptel-backoff--release fsm)))
+      ;; NOTE: no trailing transition here.  Each branch above has already
+      ;; advanced the FSM past the TYPE dispatch point; a further
+      ;; unconditional transition would make RTRY re-enter WAIT
+      ;; immediately, bypassing the backoff timer.
       (setf (alist-get process gptel--request-alist nil 'remove) nil)
       (kill-buffer proc-buf))))
 (defun gptel-curl--parse-response (proc-info)

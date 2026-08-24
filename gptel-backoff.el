@@ -393,12 +393,18 @@ available (and no cooldown is active), dispatch via
         (let ((sem (gptel-backoff--semaphore backend)))
           (if (gptel-backoff--acquire backend sem)
               (unwind-protect
-                  (progn (setq dispatched t)
-                         (plist-put info :backoff-dispatched t)
-                         (gptel--handle-wait fsm)
-                         (mapc (lambda (h) (funcall h fsm)) others))
-                ;; A synchronous throw before dispatch must release.
+                  (progn
+                    (plist-put info :backoff-dispatched t)
+                    (gptel--handle-wait fsm)
+                    ;; Dispatch started: the transport owns the slot and
+                    ;; will release it on completion.  Only a synchronous
+                    ;; throw inside `gptel--handle-wait' must undo the
+                    ;; acquire below.
+                    (setq dispatched t)
+                    (mapc (lambda (h) (funcall h fsm)) others))
+                ;; A synchronous throw before dispatch starts must release.
                 (unless dispatched
+                  (plist-put info :backoff-dispatched nil)
                   (gptel-backoff--release-backend backend sem)))
             ;; Over limit or cooling down: park in QUEUE.
             (plist-put info :queued t)
@@ -413,6 +419,18 @@ available (and no cooldown is active), dispatch via
 (defun gptel-backoff--parked-p (fsm)
   "Return non-nil if FSM is parked in RTRY or QUEUE."
   (memq (gptel-fsm-state fsm) '(RTRY QUEUE)))
+
+(defun gptel-backoff--installed-p (fsm)
+  "Return non-nil if retry/backoff is installed in FSM.
+
+The install is idempotent and adds the RTRY row to FSM's
+transition table; its presence is what makes the transport
+callbacks (url-retrieve and curl) skip the response callback on a
+retryable error.  When `gptel-request' is called with :retry nil,
+the transport must keep the pre-feature behavior (always calling
+the callback), so it keys off this test."
+  (and (gptel-fsm-table fsm)
+       (assq 'RTRY (gptel-fsm-table fsm))))
 
 (defun gptel-backoff--acquire (backend sem)
   "Try to acquire a concurrency slot for BACKEND's semaphore SEM.
