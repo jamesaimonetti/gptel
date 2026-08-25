@@ -2435,6 +2435,8 @@ BUF defaults to the current buffer."
         (and-let* ((cb (plist-get info :callback))
                    ((functionp cb)))
           (funcall cb 'abort info)))
+      (funcall abort-fn)               ;parked requests: removes nil-keyed entry
+      (gptel-backoff--release fsm)
       ;; guard: only remove keyed entry for live (non-parked) requests;
       ;; parked requests have PROC==nil and share the nil key.
       ;; (abort-fn already removed parked entries via
