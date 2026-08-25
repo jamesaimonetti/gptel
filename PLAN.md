@@ -368,29 +368,94 @@ immediately; the retry enters only via `gptel-backoff--fire` (RTRY→WAIT).
 The curl sentinel path for a retryable 429 in the non-stream transport was
 exercised live: 3 server requests, correct final callback.
 
-### Remaining work
+### Bugfix round 3 (elisp-expert second opinion + ert/e2e suite, applied Aug 25)
+
+The live-streaming and url-retrieve e2e harnesses (below) plus the
+elisp-expert second opinion surfaced four more real findings:
+
+1. **`gptel-backoff--retry-p` passed a nil `:backend` to the retryability
+   generic when the gptel-backend-name accessor could not honor it.** The
+   docstring promised nil for missing backends, but the previous fix only
+   defaulted the budget while still calling `(gptel-backoff--retryable-p
+   nil info)`. **Fix:** explicit `(and backend ...)` short-circuit.
+   Verified by both unit test and live url-retrieve retry.
+
+2. **`gptel-backoff--retry-after` treated garbage as a past date.** Per the
+   Elisp manual and `time-date` source, `(date-to-time "not-a-date")` does
+   not signal — it falls back through `timezone-make-date-arpa-standard`
+   (year 0 windows to 2000), yielding a *valid past* time, so the old
+   `condition-case` never caught it and `(max 0 ...)` returned 0 = "retry
+   immediately" for junk headers. **Fix:** strict IMF-fixdate regex gate
+   (`Mon, 02 Jan 2006 15:04:05 GMT`); anything else → nil.  Also note a
+   well-formed far-past fixdate (e.g. 1900) correctly yields 0, which
+   matches it being honored as an immediate-retry floor.
+
+3. **`gptel-abort` could orphan other parked requests.** It keyed the alist
+   removal on PROC, which is nil for every parked request; `alist-get`
+   deletes the *first* nil-keyed cell, so aborting one parked request
+   could remove an unrelated one's bookkeeping (leaking its semaphore
+   queue position and cleanup-fn). **Fix:** only remove the keyed entry
+   when PROC is non-nil; parked entries are already removed by
+   `gptel-backoff--cleanup-parked` (the abort-fn). Verified live
+   (E2E-LIMITER phase 2).
+
+4. **The limiter e2e harness's callback did not fire** until the harness
+   file carried `-*- lexical-binding: t; -*-` on line 1: the closure
+   captured the loop variable `id`/`n` dynamically (void at run time), so
+   callbacks errored silently (`gptel callback error: (void-variable id)`)
+   and the test could not detect completion. Fixed in the harness; the
+   production code was not affected (the gptel files are compiled with
+   lexical-binding).
+
+### Test suites added (this round)
+
+- **`test/gptel-backoff-tests.el`** — 18 ert unit tests: setting keyword
+  normalization, status-int, retry-after parsing (delta, IMF-fixdate,
+  garbage), jitter identity/range, delay exponential + cap + retry-after
+  floor, retryable-p (status, x-should-retry precedence, error types,
+  conservative unknown), error-retryable-p, retry-p budget/toggle/missing
+  backend, install idempotency/layout, installed-p, semaphore
+  acquire/release/pump, release idempotency + queue/slot cleanup, cooldown
+  on 429, stream truncation (present + non-stream noop), fire guards
+  (stale/cancelled/dead-buffer/live), handle-retry register/schedule,
+  cleanup-parked cancels timer.  All green; runs in ~0.2s.
+- **`test/e2e/`** — live transport smoke tests driven by
+  `run-e2e.sh` + `gptel-e2e-server.py` (fake HTTP backends on ports
+  8899/8900/8901/8902):
+  - `e2e-stream.el` — **curl streaming** with a mid-stream Anthropic
+    `overloaded_error` (HTTP 200 SSE): partial deltas are truncated by
+    `gptel-backoff--truncate-stream`, retry re-issues, final stream
+    appears exactly once.
+  - `e2e-url.el` — **url-retrieve** transport with 429×2 then 200: retry
+    transparent, final response delivered once, no spurious error
+    callback, attempts incremented.
+  - `e2e-limiter.el` — **concurrency limiter** (curl non-stream, slow
+    server): f1 holds slot, f2 QUEUEs and is resumed to DONE; then abort
+    of a queued request removes it from the semaphore queue and it is
+    never resumed.
+  All three PASS; byte-compile of all files is clean.
+
+### Remaining work (updated)
 
 - [ ] End-to-end smoke test for the **streaming** curl transport with a
-      retryable mid-stream error (e.g. Anthropic `overloaded_error`):
-      verify the partial output is truncated by
-      `gptel-backoff--truncate-stream` and the retried stream is not
-      duplicated. The mechanism is in place and the non-streaming path is
-      proven, but the streaming sentinel (`gptel-curl--stream-cleanup`)
-      hasn't been exercised end-to-end yet.
-- [ ] End-to-end smoke test for the **url-retrieve** transport (the
-      `gptel--url-get-response` callback branch) with a fake 429 backend.
-      The branch mirrors the curl sentinel logic and the FSM simulation of
-      the callback is fine, but only curl is live-tested so far.
-- [ ] ert tests (timer pumping, seeded jitter, semaphore accounting,
-      stream truncation). Batch harnesses in this round proved the
-      individual functions; a proper `test/` suite is still TODO.
+      retryable mid-stream error: **DONE — `test/e2e/e2e-stream.el`**
+      (partial output truncated, retried stream not duplicated).
+- [ ] End-to-end smoke test for the **url-retrieve** transport with a fake
+      429 backend: **DONE — `test/e2e/e2e-url.el`**.
+- [ ] ert tests: **DONE — `test/gptel-backoff-tests.el`** (18 tests, all
+      green).
 - [ ] Provider overrides for `gptel-backoff--retryable-p` where semantics
       differ (openai/anthropic/gemini) — optional, defaults are
-      conservative.
-- [ ] Decide whether `:concurrency` should also be plumbed through the
-      `gptel-make-*` constructors (currently via
-      `gptel-backoff--backend-settings` only).
+      conservative.  Still not needed; the default method already covers
+      OpenAI rate_limit_error / Anthropic overloaded_error bodies.
+- [ ] Constructor plumbing decision: **decided — no `:concurrency`
+      `&key` in `gptel-make-*` for v1** (global
+      `gptel-backoff--backend-settings` alist; see Bugfix round 2 note).
 - [ ] Verify tool-call flow end-to-end with the reordered sentinel (no
-      trailing transition) — the non-retry path is unchanged, but needs a
-      live tool-use test.
+      trailing transition) — the non-retry path is unchanged, but still
+      needs a live tool-use test.
+- [ ] Consider wiring the e2e suite into CI (e.g. a GitHub Actions job
+      running `test/e2e/run-e2e.sh` and
+      `emacs -Q --batch -L . -l test/gptel-backoff-tests.el -f
+      ert-run-tests-batch-and-exit`).
 
