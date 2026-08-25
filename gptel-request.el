@@ -2437,6 +2437,8 @@ BUF defaults to the current buffer."
           (funcall cb 'abort info)))
       ;; guard: only remove keyed entry for live (non-parked) requests;
       ;; parked requests have PROC==nil and share the nil key.
+      ;; (abort-fn already removed parked entries via
+      ;;  gptel-backoff--cleanup-parked)
       (when proc
         (setf (alist-get proc gptel--request-alist nil 'remove) nil))
       (gptel--fsm-transition fsm 'ABRT)
