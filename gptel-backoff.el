@@ -237,16 +237,25 @@ error message)."
   "Return the number of seconds to wait per HEADERS' Retry-After.
 
 HEADERS is an alist of lowercased (name . value) conses.  Supports
-both delta-seconds and HTTP-date (RFC 7231) forms.  Returns nil if
-the header is absent or unparseable."
+both delta-seconds and RFC 7231 IMF-fixdate (HTTP-date) forms.
+Returns nil if the header is absent or unparseable.  A strict
+date pattern is used so garbage that `date-to-time' would coerce
+to a (possibly past) time is rejected instead of meaning an
+immediate retry."
   (when-let* ((val (cdr (assoc "retry-after" headers))))
     (let ((val (string-trim val)))
       (cond
        ((string-match-p "\\`[0-9]+\\'" val) (string-to-number val))
-       ((condition-case nil
-            (max 0 (round (float-time (time-subtract (date-to-time val)
-                                                     (current-time)))))
-          (error nil)))))))
+       ((string-match-p
+         (concat "\\`\\(?:Mon\\|Tue\\|Wed\\|Thu\\|Fri\\|Sat\\|Sun\\), "
+                 "[0-9][0-9] "
+                 "\\(?:Jan\\|Feb\\|Mar\\|Apr\\|May\\|Jun\\|Jul\\|Aug\\|Sep\\|Oct\\|Nov\\|Dec\\) "
+                 "[0-9][0-9][0-9][0-9] "
+                 "[0-9][0-9]:[0-9][0-9]:[0-9][0-9] GMT\\'")
+         val)
+        (max 0 (round (float-time (time-subtract (date-to-time val)
+                                                 (current-time))))))
+       (t nil)))))
 
 (defun gptel-backoff--jitter (delay factor)
   "Return DELAY adjusted by +/-FACTOR random jitter.
@@ -295,7 +304,8 @@ an HTTP response are never retried anyway)."
                        (gptel-backoff--setting backend 'max-retries
                                                gptel-backoff-max-retries)
                      gptel-backoff-max-retries)))
-         (and (< attempts max)
+         (and backend
+              (< attempts max)
               (gptel-backoff--retryable-p backend info)))))
 
 
