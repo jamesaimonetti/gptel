@@ -55,6 +55,36 @@
   "File where usage records are appended, one plist per line."
   :type 'file :group 'gptel-usage)
 
+(defcustom gptel-usage-report-grouping 'all
+  "How `gptel-usage-report' groups records in time.
+
+A value of nil (or the symbol `all') treats every record as one
+period, exactly like the pre-grouping report.  Otherwise records are
+bucketed into periods and reported with one Org table per period
+(day: one combined table with a Period column), plus an overall
+total table.  Labels are local-time day (`2026-01-31'), ISO week
+(`2026-W05'), month (`2026-01') or year (`2026').
+
+Used when `gptel-usage-report' is called without an explicit
+grouping argument."
+  :type '(choice (const :tag "All time (no grouping)" all)
+                 (const :tag "By day" day)
+                 (const :tag "By week (ISO)" week)
+                 (const :tag "By month" month)
+                 (const :tag "By year" year))
+  :group 'gptel-usage)
+
+(defcustom gptel-usage-report-max-periods 24
+  "Maximum number of periods shown in a grouped `gptel-usage-report'.
+
+When a grouping such as `day' would produce more periods than this,
+the oldest periods are collapsed into a summary row/table labeled
+\"...\" and only the newest `gptel-usage-report-max-periods'
+periods are shown in detail.  The overall total table always
+covers everything."
+  :type 'integer
+  :group 'gptel-usage)
+
 (defconst gptel-usage-record-version 2
   "Schema version stamped on new usage records, under the :v key.
 
@@ -362,24 +392,48 @@ models are displayed."
         (nreverse records)))))
 
 ;;;###autoload
-(defun gptel-usage-report (&optional since)
-  "Show a summary of recorded token usage and cost, grouped by
-backend and model. With SINCE (a time value), only include records
-from that point on.
+(defun gptel-usage-report (&optional grouping since)
+  "Show recorded token usage and cost, optionally grouped by time.
 
-Interactively, a prefix argument prompts for the starting date.
+With GROUPING \(one of `day', `week', `month', `year', `all', or nil
+for all-time\), records from `gptel-usage-log-file' are bucketed
+into periods and reported as one Org table per period (plus an
+overall total table), instead of the single all-time table.  `day'
+uses one combined table with a Period column; `week' (ISO),
+`month' and `year' render a labeled table per period.  When GROUPING
+is nil, `gptel-usage-report-grouping' is consulted.
 
-The report is an Org table in an `org-mode' buffer, so it can be
-sorted, exported or extended with table formulas.  Costs are plain
-numbers rather than currency strings to keep that column numeric.
-The buffer is left writable for that reason; it is regenerated from
-`gptel-usage-log-file' on every call, so edits are never persisted."
+With SINCE \(a time value), only records from that point on are
+included; the filter is applied before grouping/bucketing.
+
+Interactively, the grouping is read from the minibuffer; a prefix
+argument additionally prompts for the starting date.
+Backward compatibility: calling with a time value as the sole
+argument still means SINCE, as in the pre-grouping API.
+
+The report is one or more Org tables in an `org-mode' buffer, so it
+can be sorted, exported or extended with table formulas.  Costs are
+plain numbers rather than currency strings to keep that column
+numeric.  The buffer is left writable for that reason; it is
+regenerated from `gptel-usage-log-file' on every call, so edits are
+never persisted.
+
+See also `gptel-usage-report-grouping' and
+`gptel-usage-report-max-periods'."
   (interactive
-   (list (when current-prefix-arg
+   (list (intern (completing-read
+                  "Group by: " '("all" "day" "week" "month" "year")
+                  nil t nil nil "all"))
+         (when current-prefix-arg
            (let ((str (read-string "Include records since (e.g. 2024-01-01): ")))
              (unless (string-blank-p str)
                (or (ignore-errors (date-to-time str))
                    (user-error "Cannot parse time: %s" str)))))))
+  ;; Legacy callers may pass the since time as the first argument.  A time
+  ;; value is a cons or number, never one of the grouping keywords.
+  (when (and (null since)
+             (not (memq grouping '(nil all day week month year))))
+    (setq since grouping grouping nil))
   (require 'org)
   (let* ((records (gptel-usage--read-log))
          (records (if since
@@ -387,18 +441,72 @@ The buffer is left writable for that reason; it is regenerated from
                        (lambda (r) (time-less-p (date-to-time (plist-get r :timestamp)) since))
                        records)
                     records))
-         (groups (make-hash-table :test #'equal)))
+         (grouping (or grouping gptel-usage-report-grouping))
+         (grouping (if (memq grouping '(all day week month year)) grouping 'all))
+         (periods (gptel-usage--cap-periods
+                   (gptel-usage--group-records records grouping)
+                   gptel-usage-report-max-periods)))
+    (with-current-buffer (get-buffer-create "*gptel-usage*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "#+TITLE: gptel token usage\n")
+        (insert (format "# Generated %s%s%s\n\n"
+                        (format-time-string "%Y-%m-%d %H:%M")
+                        (pcase grouping
+                          ('all "")
+                          (g (format " -- grouped by %s" g)))
+                        (if since
+                            (concat ", covering records since "
+                                    (format-time-string "%Y-%m-%d %H:%M" since))
+                          "")))
+        (cond
+         ;; All-time: a single table, byte-for-byte the pre-grouping output.
+         ((eq grouping 'all)
+          (gptel-usage--report-table records nil))
+         ;; Day: one combined table with a Period column.
+         ((eq grouping 'day)
+          (gptel-usage--report-day-table periods))
+         ;; Week/month/year: one labeled table per period, then an overall
+         ;; total table.
+         (t
+          (pcase-dolist (`(,label . ,recs) periods)
+            (gptel-usage--report-table recs label))
+          (insert "\n")
+          (gptel-usage--report-table records "Total")))
+        (when (null records)
+          (insert "No usage records"
+                  (if since " in the selected period" "")
+                  ".  Usage is tracked while ~gptel-usage-mode~ is enabled.\n"))
+        ;; Org mode last: it resets buffer-local state, and the table needs to
+        ;; exist before it can be aligned.
+        (org-mode)
+        (goto-char (point-min))
+        (let ((case-fold-search nil))
+          (while (re-search-forward "^|" nil t)
+            (org-table-align)))
+        (goto-char (point-min))
+        (set-buffer-modified-p nil))
+      (display-buffer (current-buffer)))))
+
+(defun gptel-usage--aggregate (records)
+  "Aggregate RECORDS (usage plists) into per-(backend, model) rows.
+
+Returns an alist of \(KEY . SUMMARY), where KEY is (BACKEND . MODEL)
+and SUMMARY is a plist with :input :output :cached :cache :cost :n
+and :cost-known.  Sorted most expensive first, then most requests.
+
+Pre-v2 records have no :cache key; treat it as zero.  :input is
+fresh input, i.e. with cache writes taken out, since backends that
+report writes fold them into :input (see `gptel-usage--cost').  This
+keeps the columns disjoint, so Input + CacheRd + CacheWr is the true
+token total."
+  (let ((groups (make-hash-table :test #'equal)))
     (dolist (r records)
       (let* ((key (cons (plist-get r :backend) (plist-get r :model)))
              (cur (or (gethash key groups)
                       (list :input 0 :output 0 :cached 0 :cache 0
                             :cost 0.0 :n 0 :cost-known t))))
         (setf (gethash key groups)
-              ;; Pre-v2 records have no :cache key; treat it as zero.
-              ;; Report fresh input, i.e. with cache writes taken out, since
-              ;; backends that report writes fold them into :input (see
-              ;; `gptel-usage--cost').  This keeps the columns disjoint, so
-              ;; Input + CacheRd + CacheWr is the true token total.
               (list :input (+ (plist-get cur :input)
                               (max 0 (- (or (plist-get r :input) 0)
                                         (or (plist-get r :cache) 0))))
@@ -408,39 +516,54 @@ The buffer is left writable for that reason; it is regenerated from
                     :cost (+ (plist-get cur :cost) (or (plist-get r :cost) 0.0))
                     :n (1+ (plist-get cur :n))
                     :cost-known (and (plist-get cur :cost-known) (plist-get r :cost))))))
-    (with-current-buffer (get-buffer-create "*gptel-usage*")
-      (let* ((inhibit-read-only t)
-             ;; `maphash' order is unspecified, so collect and sort for a
-             ;; stable report: most expensive first, then most requests.
-             (rows nil)
-             (total-cost 0.0)
-             (any-unknown nil)
-             (tot-n 0) (tot-in 0) (tot-out 0) (tot-rd 0) (tot-wr 0))
-        (erase-buffer)
-        (maphash (lambda (key v) (push (cons key v) rows)) groups)
-        (setq rows
-              (sort rows
-                    (lambda (a b)
-                      (let ((ca (and (plist-get (cdr a) :cost-known)
-                                     (plist-get (cdr a) :cost)))
-                            (cb (and (plist-get (cdr b) :cost-known)
-                                     (plist-get (cdr b) :cost))))
-                        (cond ((and ca cb (/= ca cb)) (> ca cb))
-                              ((and ca (not cb)) t)
-                              ((and cb (not ca)) nil)
-                              (t (> (plist-get (cdr a) :n)
-                                    (plist-get (cdr b) :n))))))))
-        (insert "#+TITLE: gptel token usage\n")
-        (insert (format "# Generated %s%s\n\n"
-                        (format-time-string "%Y-%m-%d %H:%M")
-                        (if since
-                            (concat ", covering records since "
-                                    (format-time-string "%Y-%m-%d %H:%M" since))
-                          "")))
-        ;; Input is fresh input only; cache reads and writes are broken out,
-        ;; so the three token columns do not overlap.  Costs are bare numbers
-        ;; (no currency symbol) so Org treats the column as numeric, which
-        ;; keeps it right-aligned and usable with table formulas.
+    ;; `maphash' order is unspecified, so collect and sort for a stable
+    ;; report: most expensive first, then most requests.
+    (let (rows)
+      (maphash (lambda (key v) (push (cons key v) rows)) groups)
+      (sort rows
+            (lambda (a b)
+              (let ((ca (and (plist-get (cdr a) :cost-known)
+                             (plist-get (cdr a) :cost)))
+                    (cb (and (plist-get (cdr b) :cost-known)
+                             (plist-get (cdr b) :cost))))
+                (cond ((and ca cb (/= ca cb)) (> ca cb))
+                      ((and ca (not cb)) t)
+                      ((and cb (not ca)) nil)
+                      (t (> (plist-get (cdr a) :n)
+                            (plist-get (cdr b) :n))))))))))
+
+(defun gptel-usage--insert-unknown-note (any-unknown)
+  "Insert the /unknown/ pricing note when ANY-UNKNOWN is non-nil."
+  (when any-unknown
+    (insert "Total covers priced models only; rows reading /unknown/ are\n"
+            "excluded because some models have no pricing configured --\n"
+            "see ~gptel-usage-pricing~.\n")))
+
+(defun gptel-usage--report-table (records &optional period-label)
+  "Render one all-time-style Org table for RECORDS in the current buffer.
+
+RECORDS is a list of usage plists as read by `gptel-usage--read-log'.
+PERIOD-LABEL, when non-nil, is shown on a \"<<< LABEL\" line above
+the table; grouped reports pass the period label, while the
+all-time report and the final overall-total table pass nil.
+
+The table has one row per (backend, model), columns Backend, Model,
+Reqs, Input, Output, CacheRd, CacheWr and Cost (USD), and ends with
+a Total row.  Input is fresh input with cache writes taken out, so
+the columns do not overlap.  Costs are bare numbers (no currency
+symbol) so Org treats the column as numeric and table formulas work.
+
+Appends the /unknown/ pricing note when some row has no pricing
+configured (see `gptel-usage-pricing').  Returns non-nil when
+RECORDS is non-empty; callers print their own empty-state message
+otherwise."
+  (when period-label
+    (insert (format "<<<%s\n\n" period-label)))
+  (let ((rows (gptel-usage--aggregate records)))
+    (when rows
+      (let ((total-cost 0.0)
+            (any-unknown nil)
+            (tot-n 0) (tot-in 0) (tot-out 0) (tot-rd 0) (tot-wr 0))
         (insert "| Backend | Model | Reqs | Input | Output | CacheRd | CacheWr | Cost (USD) |\n")
         (insert "|-\n")
         (pcase-dolist (`(,key . ,v) rows)
@@ -465,24 +588,129 @@ The buffer is left writable for that reason; it is regenerated from
         (insert (format "| Total | | %d | %d | %d | %d | %d | %.4f |\n"
                         tot-n tot-in tot-out tot-rd tot-wr total-cost))
         (insert "\n")
-        (when any-unknown
-          (insert "Total covers priced models only; rows reading /unknown/ are\n"
-                  "excluded because some models have no pricing configured --\n"
-                  "see ~gptel-usage-pricing~.\n"))
-        (unless rows
-          (insert "No usage records"
-                  (if since " in the selected period" "")
-                  ".  Usage is tracked while ~gptel-usage-mode~ is enabled.\n"))
-        ;; Org mode last: it resets buffer-local state, and the table needs to
-        ;; exist before it can be aligned.
-        (org-mode)
-        (goto-char (point-min))
-        (when (re-search-forward "^|" nil t)
-          ;; Expand the "|-" shorthand rules and pad every cell to width.
-          (org-table-align))
-        (goto-char (point-min))
-        (set-buffer-modified-p nil))
-      (display-buffer (current-buffer)))))
+        (gptel-usage--insert-unknown-note any-unknown)
+        t))))
+
+(defun gptel-usage--report-day-table (periods)
+  "Render one Org table for PERIODS with a Period column.
+
+PERIODS is the alist from `gptel-usage--group-records': (PERIOD-LABEL
+. PERIOD-RECORDS), ordered by label.  Every period contributes one
+hrule-separated block of (backend, model) rows prefixed by the
+period label; a final Total row sums the whole table.  Appends the
+/unknown/ pricing note if any row lacks pricing.  Returns non-nil
+when PERIODS is non-empty."
+  (when periods
+    (let ((first t)
+          (total-cost 0.0)
+          (any-unknown nil)
+          (tot-n 0) (tot-in 0) (tot-out 0) (tot-rd 0) (tot-wr 0))
+      (insert "| Period | Backend | Model | Reqs | Input | Output | CacheRd | CacheWr | Cost (USD) |\n")
+      (pcase-dolist (`(,label . ,recs) periods)
+        (unless first (insert "|-\n"))
+        (setq first nil)
+        (pcase-dolist (`(,key . ,v) (gptel-usage--aggregate recs))
+          (insert (format "| %s | %s | %s | %d | %d | %d | %d | %d | %s |\n"
+                          (gptel-usage--org-escape label)
+                          (gptel-usage--org-escape (car key))
+                          (gptel-usage--org-escape (cdr key))
+                          (plist-get v :n) (plist-get v :input)
+                          (plist-get v :output) (plist-get v :cached)
+                          (plist-get v :cache)
+                          (if (plist-get v :cost-known)
+                              (format "%.4f" (plist-get v :cost))
+                            "unknown")))
+          (cl-incf tot-n (plist-get v :n))
+          (cl-incf tot-in (plist-get v :input))
+          (cl-incf tot-out (plist-get v :output))
+          (cl-incf tot-rd (plist-get v :cached))
+          (cl-incf tot-wr (plist-get v :cache))
+          (if (plist-get v :cost-known)
+              (cl-incf total-cost (plist-get v :cost))
+            (setq any-unknown t))))
+      (insert "|-\n")
+      (insert (format "| Total | | | %d | %d | %d | %d | %d | %.4f |\n"
+                      tot-n tot-in tot-out tot-rd tot-wr total-cost))
+      (insert "\n")
+      (gptel-usage--insert-unknown-note any-unknown)
+      t)))
+
+(defun gptel-usage--cap-periods (periods max-periods)
+  "Cap PERIODS to at most MAX-PERIODS displayed period blocks.
+
+PERIODS is the alist from `gptel-usage--group-records', ordered by
+label.  When its length exceeds MAX-PERIODS, the oldest periods are
+merged into a single leading group labeled \"...\" so the report
+shows exactly MAX-PERIODS blocks: the collapsed summary plus the
+newest MAX-PERIODS - 1 periods in detail.  The \"?\" group (records
+with unknown dates) never counts toward the cap and always remains
+its own last group.
+
+Returns a new alist; PERIODS is not modified."
+  (if (or (null max-periods) (<= (length periods) max-periods))
+      periods
+    (let* ((unknown (and (equal (caar (last periods)) "?")
+                         (car (last periods))))
+           (rest (if unknown (butlast periods) periods))
+           (n-drop (- (length rest) (1- max-periods)))
+           (dropped (and (> n-drop 0) (cl-subseq rest 0 n-drop)))
+           (kept (and (> n-drop 0) (cl-subseq rest n-drop))))
+      (cond
+       ((null dropped)
+        (if unknown (append rest (list unknown)) periods))
+       (t
+        (append (list (cons "..." (apply #'append (mapcar #'cdr dropped))))
+                kept
+                (and unknown (list unknown))))))))
+
+(defun gptel-usage--group-records (records grouping)
+  "Group RECORDS (list of usage plists) under GROUPING.
+
+GROUPING is one of `day', `week', `month', `year', or `all'/nil \(in
+which case the single entry (nil . RECORDS) is returned).  Otherwise
+returns an alist of (PERIOD-LABEL . PERIOD-RECORDS), ordered by
+label \(which for the chosen labels is also chronological), with an
+entry labeled \"?\" appended last for records whose :timestamp is
+missing or unparseable.
+
+See `gptel-usage--bucket-key' for the label format."
+  (if (memq grouping '(all nil))
+      (and records (list (cons nil records)))
+    (let ((table (make-hash-table :test #'equal)))
+      (dolist (r records)
+        (let ((label (gptel-usage--bucket-key r grouping)))
+          (puthash label (cons r (gethash label table)) table)))
+      (let (groups)
+        (maphash (lambda (label recs)
+                   (push (cons label (nreverse recs)) groups))
+                 table)
+        ;; "?" sorts last, even after "..." (0x3F > 0x2E and > all digits).
+        (sort groups (lambda (a b) (string< (car a) (car b))))))))
+
+(defun gptel-usage--bucket-key (record grouping)
+  "Return the period label for RECORD under GROUPING.
+
+GROUPING is one of `day', `week', `month' or `year'.  The label is
+the local-time formatted period: `%Y-%m-%d' for `day', ISO week
+`%G-W%V' for `week' (the ISO week-year, so weeks straddling a year
+sort correctly), `%Y-%m' for `month' and `%Y' for `year'.  A record
+with a missing or unparseable :timestamp returns \"?\"."
+  (let ((ts (plist-get record :timestamp)))
+    ;; `date-to-time' silently maps garbage input to a fixed date instead of
+    ;; signaling, so validate the shape our records are written in rather
+    ;; than relying on an error.
+    (if (and (stringp ts)
+             (string-match-p
+              "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}"
+              ts))
+        (format-time-string
+         (pcase grouping
+           ('day "%Y-%m-%d")
+           ('week "%G-W%V")
+           ('month "%Y-%m")
+           ('year "%Y"))
+         (date-to-time ts))
+      "?")))
 
 (provide 'gptel-usage)
 ;;; gptel-usage.el ends here
