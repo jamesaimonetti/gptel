@@ -1,9 +1,14 @@
 ;;; gptel-usage.el --- Track token usage and cost per backend/model -*- lexical-binding: t; -*-
 
-;; Records :tokens from each gptel request's FSM info plist -- the same
-;; per-request (:input :output :cached :cache) data that drives gptel's
-;; own header-line stats display, so there's no need to re-parse raw
-;; response JSON here at all.
+;; Records :tokens-full from each gptel request's FSM info plist -- the
+;; same (:input :output :cached :cache) data that drives gptel's own
+;; header-line stats display, so there's no need to re-parse raw
+;; response JSON here at all.  :tokens-full is the cumulative usage for
+;; the whole request, which for tool-call (multi-turn) requests is the
+;; figure the provider actually bills; :tokens only covers the final
+;; turn.  :tokens-full is preferred, falling back to :tokens for FSMs
+;; that never accumulated one (single-turn requests carry the same
+;; numbers in both keys, so this is just the all-time simple path).
 ;;
 ;; Note: `gptel-post-response-functions' is called with the response
 ;; buffer positions (BEG END), NOT the FSM, so this package instead
@@ -215,25 +220,33 @@ without prompt caching report no :cache and are unaffected."
 
 Meant as :after advice for `gptel--handle-post-insert' (and
 `gptel--handle-error'), which receive the FSM as their sole argument.
-Silently does nothing if the FSM has no :tokens data (e.g. the
+Silently does nothing if the FSM has no token data (e.g. the
 provider didn't report usage, or the request failed before any usage
 was returned).  Errors are caught so tracking can never break gptel
 request handling.
 
-Recording is idempotent per turn: the :tokens plist recorded last is
+Records :tokens-full, the cumulative usage for the whole request --
+the figure gptel's own header line shows and the one the provider
+bills.  For single-turn requests :tokens-full carries the same
+numbers as :tokens; for multi-turn (tool call) requests it sums every
+round trip, whereas :tokens only holds the final turn.  :tokens is
+used as a fallback for FSMs that never accumulated a :tokens-full
+(e.g. synthetic or pre-v1.0 FSMs).
+
+Recording is idempotent per turn: the token plist recorded last is
 remembered on the FSM info (under :gptel-usage-last-tokens) and
 compared with `eq', so a request that reaches more than one advised
 handler is logged only once.  Each turn of a multi-turn (tool call)
-request gets a fresh :tokens object from the backend parser, so
-retries and subsequent turns are still recorded when they occur.
-
-Note: this records :tokens, the usage for this turn, not :tokens-full,
-the cumulative usage for the whole request.  For a request that makes
-tool calls and thus several round trips, only the turn that reached
-the advised handler is logged."
+request gets a fresh :tokens-full object from the backend parser, so
+retries and subsequent turns are still recorded when they occur."
   (condition-case-unless-debug err
       (let* ((info (gptel-fsm-info fsm))
-             (tokens (plist-get info :tokens))
+             ;; :tokens-full is the whole-request total (what the provider
+             ;; bills); :tokens is only the final turn, which badly
+             ;; understates agentic/tool-call requests.  Prefer the former,
+             ;; fall back to the latter for FSMs without cumulative data.
+             (tokens (or (plist-get info :tokens-full)
+                         (plist-get info :tokens)))
              (backend (plist-get info :backend))
              (model (gptel--to-string (plist-get info :model))))
         (when (and tokens
