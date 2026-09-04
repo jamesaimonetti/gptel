@@ -79,7 +79,7 @@ first to the last breakpoint)."
 MESSAGE is a plist \(:role ... :content CONTENT) as produced by
 `gptel--parse-list' or `gptel--parse-buffer'.  CONTENT is either a
 string \(a single text block) or a vector of content blocks; the
-breakpoint goes on the first block.
+breakpoint goes on the first cacheable block (see below).
 
 With NORMALIZE-ONLY, no breakpoint is added: string CONTENT is
 converted to a one-element vector of text blocks and the message is
@@ -94,14 +94,30 @@ example marks the final block one turn and leaves it unmarked the next,
 still hitting), so only the representation needs to be pinned.
 
 Uses `gptel--anthropic-cache-entry' for the cache_control plist, so the
-TTL follows `gptel-anthropic-cache-ttl'."
+TTL follows `gptel-anthropic-cache-ttl'.
+
+Anthropic rejects cache_control on some block types (thinking blocks
+and empty text blocks) with an `invalid_request_error', so when the
+first block is not cacheable the breakpoint is placed on the first
+cacheable block -- typically the text block that follows a thinking
+block in an extended-thinking assistant turn.  A message whose blocks
+are all non-cacheable is left unmarked."
   (let ((content (plist-get message :content)))
     (when (stringp content)
       (setq content `[(:type "text" :text ,content)])
       (plist-put message :content content))
     (unless normalize-only
-      (nconc (aref content 0)
-             (list :cache_control (gptel--anthropic-cache-entry))))
+      (cl-loop for i below (length content)
+               for block = (aref content i)
+               for type = (plist-get block :type)
+               ;; Cacheable: anything but thinking blocks and empty text
+               ;; blocks (both rejected by the API with a 400).
+               when (and (not (equal type "thinking"))
+                         (not (and (equal type "text")
+                                   (string-empty-p
+                                    (or (plist-get block :text) "")))))
+               return (nconc block (list :cache_control
+                                         (gptel--anthropic-cache-entry)))))
     message))
 
 (defun gptel--anthropic-cache-messages (messages)
@@ -128,6 +144,48 @@ prefix cannot differ between turns for reasons unrelated to content."
                when (= i break-idx)
                do (gptel--anthropic-cache-message msg)))
     messages))
+
+(defun gptel--anthropic-clear-cache-control (message)
+  "Remove any :cache_control breakpoints from MESSAGE's content blocks.
+
+Used before re-stamping the messages of a reused request payload:
+history grows between tool rounds, and a breakpoint left on a message
+that is no longer the last stable block would pin an outdated cache
+prefix."
+  (let ((content (plist-get message :content)))
+    (when (vectorp content)
+      (cl-loop for i below (length content)
+               for block = (aref content i)
+               when (plist-member block :cache_control)
+               do (aset content i
+                        (cl-loop for (k v) on block by 'cddr
+                                 unless (eq k :cache_control)
+                                 append (list k v))))))
+  message)
+
+(cl-defmethod gptel--cache-messages ((_backend gptel-anthropic) data)
+  "Re-stamp prompt-cache breakpoints on ANTHROPIC request DATA.
+
+The initial request construction (`gptel--parse-buffer' and
+`gptel--parse-list') stamps the second-to-last message once.  In
+agentic tool loops the FSM reuses the same DATA: `gptel-curl--parse-stream'
+appends assistant tool_use messages and `gptel--inject-prompt' appends
+tool_result messages between rounds, bypassing the parse-time stamping.
+A breakpoint left on the original second-to-last message no longer marks
+the end of the stable prefix, and the grown history would be re-sent
+uncached every round.
+
+This method clears any stale breakpoints, pins every message to an array
+content representation (so the wire format of the cached prefix cannot
+shift between turns), and re-applies `gptel--anthropic-cache-messages' to
+the full history -- moving the breakpoint to the new second-to-last
+message, i.e. the last stable block before the incoming prompt.
+
+The messages in DATA are mutated in place; the return value is DATA."
+  (when-let* ((messages (plist-get data :messages)))
+    (mapc #'gptel--anthropic-clear-cache-control (append messages nil))
+    (gptel--anthropic-cache-messages (append messages nil)))
+  data)
 
 (defun gptel--anthropic-update-tokens (usage info)
   "Update token usage information from USAGE.
