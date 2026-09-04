@@ -1743,6 +1743,20 @@ This will be injected into the messages list in the prompt to
 send to the LLM.")
 
 ;; FIXME(fsm) unify this with `gptel--inject-media', which is a mess
+(cl-defgeneric gptel--cache-messages (_backend data)
+  "Re-apply prompt-cache breakpoints to request DATA before a re-send.
+
+Prompts are parsed and decorated once when a request is first realized.
+Requests that continue on the same state machine (agentic tool loops)
+reuse DATA from INFO and append new messages between turns, so the
+breakpoint stamped on the initial parse no longer marks the stable
+prefix shared with the previous send.  This function lets backends
+clear stale breakpoints and re-stamp based on the full, grown history.
+
+The default implementation leaves DATA unchanged; backends that support
+prompt caching implement a method for their backend class."
+  data)
+
 (cl-defgeneric gptel--inject-prompt
     (_backend data new-prompt &optional position)
   "Inject NEW-PROMPT into existing prompts in query DATA.
@@ -1904,6 +1918,15 @@ MACHINE is an instance of `gptel-fsm'"
     (dolist (key '(:tool-result :tool-use :error :http-status :reasoning :tokens))
       (when (plist-get req-info key)
         (plist-put req-info key nil)))
+    ;; Re-stamp prompt-cache breakpoints before every network request.
+    ;; The initial parse decorates messages once; agentic tool loops reuse
+    ;; this payload and grow the history between rounds, so a breakpoint
+    ;; stamped on the original parse would no longer mark the stable
+    ;; prefix shared with the previous send.  Backends without prompt
+    ;; caching are unaffected (default no-op).
+    (when-let* ((backend (plist-get req-info :backend))
+                (data (plist-get req-info :data)))
+      (gptel--cache-messages backend data))
     (funcall
      (if gptel-use-curl
          #'gptel-curl-get-response
