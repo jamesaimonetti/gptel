@@ -40,6 +40,95 @@
                                (:copier nil)
                                (:include gptel-backend)))
 
+(defcustom gptel-anthropic-cache-ttl "5m"
+  "Cache TTL for Anthropic prompt caching, \"5m\" or \"1h\".
+
+Anthropic's ephemeral prompt caches expire after 5 minutes unless an
+explicit `:ttl' of \"1h\" is requested (the server must advertise the
+`extended-cache-ttl-2025-04-11' beta header, which gptel sends by
+default, to accept it).
+
+- \"5m\" (the default) costs 1.25x base input per cache write and
+  matches upstream gptel behavior.
+- \"1h\" costs 2x base input per cache write but survives multi-minute
+  idle gaps between turns and long tool runs, which otherwise silently
+  miss the cache and re-pay a full write.
+
+The break-even is roughly two cache reads per write, so \"1h\" pays for
+itself in conversations with natural pauses of more than a few minutes.
+The chosen TTL is applied uniformly to tools, the system prompt and the
+message breakpoint; mixing TTLs is only legal when longer ones precede
+shorter ones, and a uniform value avoids that hazard entirely."
+  :type '(choice (const :tag "5 minutes (1.25x write cost)" "5m")
+                 (const :tag "1 hour (2x write cost)" "1h"))
+  :group 'gptel
+  :safe #'stringp)
+
+(defun gptel--anthropic-cache-entry ()
+  "Return the cache_control plist for an Anthropic cache breakpoint.
+
+Includes the `:ttl' from `gptel-anthropic-cache-ttl', so every
+breakpoint in a request carries the same TTL (required by Anthropic's
+rule that breakpoint TTLs must form a non-increasing sequence from the
+first to the last breakpoint)."
+  `(:type "ephemeral" :ttl ,gptel-anthropic-cache-ttl))
+
+(defun gptel--anthropic-cache-message (message &optional normalize-only)
+  "Add a cache breakpoint to MESSAGE and return MESSAGE.
+
+MESSAGE is a plist \(:role ... :content CONTENT) as produced by
+`gptel--parse-list' or `gptel--parse-buffer'.  CONTENT is either a
+string \(a single text block) or a vector of content blocks; the
+breakpoint goes on the first block.
+
+With NORMALIZE-ONLY, no breakpoint is added: string CONTENT is
+converted to a one-element vector of text blocks and the message is
+returned unchanged otherwise.  This keeps the wire representation of
+every message stable across turns: Anthropic's prompt-cache prefix is a
+hash of the prompt as sent, and the same logical message must not flip
+between a JSON string and a JSON array depending on where the
+cache_control breakpoint happens to sit this turn -- the hash would
+change and the cache would miss.  Anthropic ignores the cache_control
+field itself when computing the prefix hash (the docs' multi-turn
+example marks the final block one turn and leaves it unmarked the next,
+still hitting), so only the representation needs to be pinned.
+
+Uses `gptel--anthropic-cache-entry' for the cache_control plist, so the
+TTL follows `gptel-anthropic-cache-ttl'."
+  (let ((content (plist-get message :content)))
+    (when (stringp content)
+      (setq content `[(:type "text" :text ,content)])
+      (plist-put message :content content))
+    (unless normalize-only
+      (nconc (aref content 0)
+             (list :cache_control (gptel--anthropic-cache-entry))))
+    message))
+
+(defun gptel--anthropic-cache-messages (messages)
+  "Add message-level cache breakpoints to MESSAGES.
+
+MESSAGES is the list of message plists produced by `gptel--parse-list'
+or `gptel--parse-buffer'.  The breakpoint goes on the LAST STABLE
+message -- the second-to-last when there are at least two messages --
+leaving the incoming (last) message uncached: it changes on every
+request, and a breakpoint on it would force a full cache write and
+guarantee a miss (the documented \"breakpoint on changing content\"
+anti-pattern).  For a fresh conversation (a single message) there is no
+stable prefix yet, so fall back to caching that message.
+
+Every message's content is pinned to an array of content blocks (see
+`gptel--anthropic-cache-message'), so the representation of the cached
+prefix cannot differ between turns for reasons unrelated to content."
+  (when messages
+    (let* ((n (length messages))
+           (break-idx (if (>= n 2) (- n 2) 0)))
+      (cl-loop for msg in messages
+               for i upfrom 0
+               do (gptel--anthropic-cache-message msg t)
+               when (= i break-idx)
+               do (gptel--anthropic-cache-message msg)))
+    messages))
+
 (defun gptel--anthropic-update-tokens (usage info)
   "Update token usage information from USAGE.
 USAGE is part of the response, INFO is the request plist."
@@ -55,7 +144,18 @@ USAGE is part of the response, INFO is the request plist."
         (plist-put info :tokens tokens) ;Tokens for this turn
         (plist-put info :tokens-full    ;Tokens for full request
                    (gptel--sum-plists (plist-get info :tokens-full)
-                                      tokens))))))
+                                      tokens))
+        ;; Cache health per turn: cache_read vs (input + cache_write).
+        ;; A prompt-cache miss shows up here as cache_creation dwarfing
+        ;; cache_read, which is the smoking-gun check for the breakpoint
+        ;; and TTL settings.
+        (when (eq gptel-log-level 'debug)
+          (gptel--log
+           (format (concat "{\"input_tokens\": %d, "
+                           "\"cache_read_input_tokens\": %d, "
+                           "\"cache_creation_input_tokens\": %d}")
+                   input cached cache)
+           "anthropic cache usage"))))))
 
 ;; NOTE the crucial difference between
 ;; - (push val (plist-get info :key)) and
@@ -246,10 +346,10 @@ Mutate state INFO with response metadata."
                             (nconc (list :type "text" :text part)
                                    (and cachep
                                         (list :cache_control
-                                              '(:type "ephemeral")))))
+                                              (gptel--anthropic-cache-entry)))))
                           gptel-system-prompt)))
         (cachep `[(:type "text" :text ,gptel-system-prompt
-                         :cache_control (:type "ephemeral"))])
+                         :cache_control ,(gptel--anthropic-cache-entry))])
         (t gptel-system-prompt))))
     (when gptel-temperature
       (plist-put prompts-plist :temperature gptel-temperature))
@@ -262,7 +362,7 @@ Mutate state INFO with response metadata."
           (when (and (or (eq gptel-cache t) (memq 'tool gptel-cache))
                      (gptel--model-capable-p 'cache))
             (nconc (aref tools-array (1- (length tools-array)))
-                   '(:cache_control (:type "ephemeral")))))))
+                   (list :cache_control (gptel--anthropic-cache-entry)))))))
     (when gptel--schema
       (plist-put prompts-plist :tools
                  (vconcat
@@ -430,11 +530,19 @@ Generate a random ID if TOOL-ID is nil."
                     if text
                     collect (list :role (if role "user" "assistant")
                                   :content `[(:type "text" :text ,text)])))))
-    ;; cache messages if required: add cache_control to the last message
+    ;; Cache messages if required: put the breakpoint on the last *stable*
+    ;; message, not the last message overall.  The last message is the
+    ;; incoming prompt, which changes on every request; a breakpoint there
+    ;; forces a full cache write on every turn.  The second-to-last message
+    ;; is the prefix shared with the previous request, so each turn writes
+    ;; only the new block and reads the previous write (Anthropic's
+    ;; documented multi-turn pattern).  For a fresh conversation (a single
+    ;; message) there is no stable prefix yet, so fall back to caching that
+    ;; message -- harmless there, and matches upstream behavior for
+    ;; tool-call turns.
     (when (and (or (eq gptel-cache t) (memq 'message gptel-cache))
                (gptel--model-capable-p 'cache))
-      (nconc (aref (plist-get (car (last full-prompt)) :content) 0)
-             '(:cache_control (:type "ephemeral"))))
+      (gptel--anthropic-cache-messages full-prompt))
     full-prompt))
 
 (cl-defmethod gptel--parse-buffer ((backend gptel-anthropic) &optional max-entries)
@@ -497,17 +605,15 @@ Include up to MAX-ENTRIES queries/responses."
         ;; XXX fails if content is empty.  The correct error behavior is left to
         ;; a future discussion.
         (push (list :role "user" :content content) prompts)))
-    ;; Cache messages if required: add cache_control to the last message
-    (if (and (or (eq gptel-cache t) (memq 'message gptel-cache))
-             (gptel--model-capable-p 'cache))
-        (let ((last-message (plist-get (car (last prompts)) :content)))
-          (if (stringp last-message)
-              (plist-put
-               (car (last prompts)) :content
-               `[(:type "text" :text ,last-message
-                  :cache_control (:type "ephemeral"))])
-            (nconc (aref (plist-get (car (last prompts)) :content) 0)
-                   '(:cache_control (:type "ephemeral"))))))
+    ;; Cache messages if required: put the breakpoint on the last *stable*
+    ;; message.  Point is at the end of the buffer, so the last message is
+    ;; the incoming user prompt (fresh, must not be cached); the
+    ;; second-to-last is the previous assistant turn -- the end of the
+    ;; prefix shared with the previous request.  A single message (fresh
+    ;; conversation) has no stable prefix yet, so cache it directly.
+    (when (and (or (eq gptel-cache t) (memq 'message gptel-cache))
+               (gptel--model-capable-p 'cache))
+      (gptel--anthropic-cache-messages prompts))
     prompts))
 
 (defun gptel--anthropic-parse-multipart (parts)
