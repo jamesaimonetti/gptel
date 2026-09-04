@@ -90,6 +90,34 @@ covers everything."
   :type 'integer
   :group 'gptel-usage)
 
+(defcustom gptel-usage-annotate-cache-ratio t
+  "Whether `gptel-usage-report' shows a Cache% column.
+
+When non-nil (the default), the report tables gain a Cache% column:
+CacheRd / (Input + CacheRd + CacheWr), i.e. the fraction of input
+tokens served from the prompt cache.  A low number next to healthy
+cache write counts is the first sign that breakpoints are missing or
+the cache keeps expiring (Anthropic's 5-minute default TTL), which is
+exactly the failure mode this column exists to surface.
+
+Set to nil to revert to the pre-annotation column set (Backend, Model,
+Reqs, Input, Output, CacheRd, CacheWr, Cost)."
+  :type 'boolean
+  :group 'gptel-usage)
+
+(defun gptel-usage--cache-ratio (input cached cache)
+  "Return the prompt-cache hit ratio for INPUT, CACHED and CACHE tokens.
+
+CACHE (cache writes/creation) is folded into the total alongside
+INPUT because Anthropic bills it as input; the ratio is CACHED /
+\(INPUT + CACHED + CACHE).  Returns a formatted percentage string
+with one decimal place, or \"0.0\" when there are no input tokens of
+any kind."
+  (let ((total (+ input cached cache)))
+    (if (zerop total)
+        "0.0"
+      (format "%.1f" (* 100.0 (/ (float cached) total))))))
+
 (defconst gptel-usage-record-version 2
   "Schema version stamped on new usage records, under the :v key.
 
@@ -561,10 +589,12 @@ the table; grouped reports pass the period label, while the
 all-time report and the final overall-total table pass nil.
 
 The table has one row per (backend, model), columns Backend, Model,
-Reqs, Input, Output, CacheRd, CacheWr and Cost (USD), and ends with
-a Total row.  Input is fresh input with cache writes taken out, so
-the columns do not overlap.  Costs are bare numbers (no currency
-symbol) so Org treats the column as numeric and table formulas work.
+Reqs, Input, Output, CacheRd, CacheWr and Cost (USD), plus a Cache%
+column when `gptel-usage-annotate-cache-ratio' is non-nil, and ends
+with a Total row.  Input is fresh input with cache writes taken out,
+so the columns do not overlap; Cache% = CacheRd / (Input + CacheRd +
+CacheWr).  Costs are bare numbers (no currency symbol) so Org treats
+the column as numeric and table formulas work.
 
 Appends the /unknown/ pricing note when some row has no pricing
 configured (see `gptel-usage-pricing').  Returns non-nil when
@@ -576,16 +606,26 @@ otherwise."
     (when rows
       (let ((total-cost 0.0)
             (any-unknown nil)
+            (show-cache-ratio gptel-usage-annotate-cache-ratio)
             (tot-n 0) (tot-in 0) (tot-out 0) (tot-rd 0) (tot-wr 0))
-        (insert "| Backend | Model | Reqs | Input | Output | CacheRd | CacheWr | Cost (USD) |\n")
+        (insert (format "| Backend | Model | Reqs | Input | Output | CacheRd | CacheWr |%s Cost (USD) |\n"
+                        (if show-cache-ratio " Cache% |" "")))
         (insert "|-\n")
         (pcase-dolist (`(,key . ,v) rows)
-          (insert (format "| %s | %s | %d | %d | %d | %d | %d | %s |\n"
+          (insert (format "| %s | %s | %d | %d | %d | %d | %d |%s %s |\n"
                           (gptel-usage--org-escape (car key))
                           (gptel-usage--org-escape (cdr key))
                           (plist-get v :n) (plist-get v :input)
                           (plist-get v :output) (plist-get v :cached)
                           (plist-get v :cache)
+                          (if show-cache-ratio
+                              (concat " "
+                                      (gptel-usage--cache-ratio
+                                       (plist-get v :input)
+                                       (plist-get v :cached)
+                                       (plist-get v :cache))
+                                      " |")
+                            "")
                           (if (plist-get v :cost-known)
                               (format "%.4f" (plist-get v :cost))
                             "unknown")))
@@ -598,8 +638,13 @@ otherwise."
               (cl-incf total-cost (plist-get v :cost))
             (setq any-unknown t)))
         (insert "|-\n")
-        (insert (format "| Total | | %d | %d | %d | %d | %d | %.4f |\n"
-                        tot-n tot-in tot-out tot-rd tot-wr total-cost))
+        (insert (format "| Total | | %d | %d | %d | %d | %d |%s %.4f |\n"
+                        tot-n tot-in tot-out tot-rd tot-wr
+                        (if show-cache-ratio
+                            (concat " " (gptel-usage--cache-ratio
+                                         tot-in tot-rd tot-wr) " |")
+                          "")
+                        total-cost))
         (insert "\n")
         (gptel-usage--insert-unknown-note any-unknown)
         t))))
@@ -610,26 +655,37 @@ otherwise."
 PERIODS is the alist from `gptel-usage--group-records': (PERIOD-LABEL
 . PERIOD-RECORDS), ordered by label.  Every period contributes one
 hrule-separated block of (backend, model) rows prefixed by the
-period label; a final Total row sums the whole table.  Appends the
-/unknown/ pricing note if any row lacks pricing.  Returns non-nil
-when PERIODS is non-empty."
+period label; a final Total row sums the whole table.  Gains a
+Cache% column when `gptel-usage-annotate-cache-ratio' is non-nil.
+Appends the /unknown/ pricing note if any row lacks pricing.  Returns
+non-nil when PERIODS is non-empty."
   (when periods
     (let ((first t)
+          (show-cache-ratio gptel-usage-annotate-cache-ratio)
           (total-cost 0.0)
           (any-unknown nil)
           (tot-n 0) (tot-in 0) (tot-out 0) (tot-rd 0) (tot-wr 0))
-      (insert "| Period | Backend | Model | Reqs | Input | Output | CacheRd | CacheWr | Cost (USD) |\n")
+      (insert (format "| Period | Backend | Model | Reqs | Input | Output | CacheRd | CacheWr |%s Cost (USD) |\n"
+                      (if show-cache-ratio " Cache% |" "")))
       (pcase-dolist (`(,label . ,recs) periods)
         (unless first (insert "|-\n"))
         (setq first nil)
         (pcase-dolist (`(,key . ,v) (gptel-usage--aggregate recs))
-          (insert (format "| %s | %s | %s | %d | %d | %d | %d | %d | %s |\n"
+          (insert (format "| %s | %s | %s | %d | %d | %d | %d | %d |%s %s |\n"
                           (gptel-usage--org-escape label)
                           (gptel-usage--org-escape (car key))
                           (gptel-usage--org-escape (cdr key))
                           (plist-get v :n) (plist-get v :input)
                           (plist-get v :output) (plist-get v :cached)
                           (plist-get v :cache)
+                          (if show-cache-ratio
+                              (concat " "
+                                      (gptel-usage--cache-ratio
+                                       (plist-get v :input)
+                                       (plist-get v :cached)
+                                       (plist-get v :cache))
+                                      " |")
+                            "")
                           (if (plist-get v :cost-known)
                               (format "%.4f" (plist-get v :cost))
                             "unknown")))
@@ -642,8 +698,13 @@ when PERIODS is non-empty."
               (cl-incf total-cost (plist-get v :cost))
             (setq any-unknown t))))
       (insert "|-\n")
-      (insert (format "| Total | | | %d | %d | %d | %d | %d | %.4f |\n"
-                      tot-n tot-in tot-out tot-rd tot-wr total-cost))
+      (insert (format "| Total | | | %d | %d | %d | %d | %d |%s %.4f |\n"
+                      tot-n tot-in tot-out tot-rd tot-wr
+                      (if show-cache-ratio
+                          (concat " " (gptel-usage--cache-ratio
+                                       tot-in tot-rd tot-wr) " |")
+                        "")
+                      total-cost))
       (insert "\n")
       (gptel-usage--insert-unknown-note any-unknown)
       t)))
