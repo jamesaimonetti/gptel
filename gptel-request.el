@@ -3310,8 +3310,8 @@ PROCESS and _STATUS are process parameters."
                 ;; buffer (buffer-layout ordering is load-bearing).
                 (progn
                   ;; Look for a reasoning block
-                  (if (and (stringp response) (string-match-p "^\\s-* thinking" response))
-                      (when-let* ((idx (string-search " response" response)))
+                  (if (and (stringp response) (string-match-p "^\\s-*<think>" response))
+                      (when-let* ((idx (string-search "</think>" response)))
                         (with-demoted-errors "gptel callback error: %S"
                           (funcall proc-callback
                                    (cons 'reasoning (substring response nil (+ idx 8)))
